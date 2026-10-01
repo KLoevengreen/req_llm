@@ -357,6 +357,102 @@ defmodule ReqLLM.Providers.OpenAITest do
       assert body["reasoning"] == %{"effort" => "low"}
     end
 
+    test "attach_stream omits authorization for explicit anonymous auth" do
+      model = %LLMDB.Model{
+        provider: :openai,
+        id: "anonymous-chat-model",
+        base_url: "http://localhost:8000/v1",
+        extra: %{wire: %{protocol: "openai_chat"}}
+      }
+
+      opts = [
+        auth_mode: "none",
+        api_key: "synthetic-configured-api-key",
+        oauth_file: "/missing/synthetic-oauth.json"
+      ]
+
+      {:ok, request} = OpenAI.attach_stream(model, context_fixture(), opts, nil)
+
+      refute Enum.any?(request.headers, fn {name, _value} ->
+               String.downcase(name) == "authorization"
+             end)
+    end
+
+    test "streaming requests preserve an explicit provider wire model ID" do
+      for protocol <- ["openai_chat", "openai_responses"] do
+        model = %LLMDB.Model{
+          provider: :openai,
+          id: "catalog-model",
+          provider_model_id: "exact-wire-model",
+          base_url: "http://localhost:8000/v1",
+          extra: %{wire: %{protocol: protocol}}
+        }
+
+        {:ok, request} = OpenAI.attach_stream(model, context_fixture(), [auth_mode: :none], nil)
+        assert ReqLLM.Test.Helpers.json_body(request)["model"] == "exact-wire-model"
+      end
+
+      model = %LLMDB.Model{
+        provider: :openai,
+        id: "catalog-model",
+        provider_model_id: "exact-wire-model",
+        base_url: "http://localhost:8000/v1",
+        extra: %{wire: %{protocol: "openai_responses"}}
+      }
+
+      {:ok, request} =
+        ReqLLM.Providers.OpenAI.ResponsesAPI.attach_websocket_stream(
+          model,
+          context_fixture(),
+          auth_mode: :none
+        )
+
+      assert [event] = request.initial_messages
+      assert Jason.decode!(event)["model"] == "exact-wire-model"
+    end
+
+    test "anonymous requests reject preconfigured authentication rather than transmitting it" do
+      model = %LLMDB.Model{
+        provider: :openai,
+        id: "anonymous-chat-model",
+        base_url: "http://localhost:8000/v1",
+        extra: %{wire: %{protocol: "openai_chat"}}
+      }
+
+      for request <- [
+            Req.new(auth: {:bearer, "synthetic-must-not-leak"}),
+            Req.new(headers: [{"Authorization", "Bearer synthetic-must-not-leak"}])
+          ] do
+        assert_raise ReqLLM.Error.Invalid.Parameter, fn ->
+          OpenAI.attach(request, model, auth_mode: :none)
+        end
+      end
+
+      for opts <- [
+            [auth_mode: :none, auth: {:bearer, "synthetic-must-not-leak"}],
+            [auth_mode: :none, headers: [{"Authorization", "Bearer synthetic-must-not-leak"}]]
+          ] do
+        assert_raise ReqLLM.Error.Invalid.Parameter, fn ->
+          OpenAI.attach(Req.new(), model, opts)
+        end
+      end
+
+      assert {:error, error} =
+               OpenAI.attach_stream(
+                 model,
+                 context_fixture(),
+                 [
+                   auth_mode: :none,
+                   req_http_options: [
+                     headers: [{"Authorization", "Bearer synthetic-must-not-leak"}]
+                   ]
+                 ],
+                 nil
+               )
+
+      refute Exception.message(error) =~ "synthetic-must-not-leak"
+    end
+
     test "prepare_request for :object defaults token limit from model output limit" do
       {:ok, model} = ReqLLM.model("openai:gpt-4o-mini")
       context = context_fixture()
@@ -448,6 +544,122 @@ defmodule ReqLLM.Providers.OpenAITest do
         )
 
       assert request.headers["authorization"] == ["Bearer #{oauth_token}"]
+    end
+
+    test "prepare_request omits authorization for explicit anonymous auth" do
+      model = %LLMDB.Model{
+        provider: :openai,
+        id: "anonymous-chat-model",
+        base_url: "http://localhost:8000/v1",
+        extra: %{wire: %{protocol: "openai_chat"}}
+      }
+
+      opts = [
+        auth_mode: :none,
+        api_key: "synthetic-configured-api-key",
+        oauth_file: "/missing/synthetic-oauth.json"
+      ]
+
+      {:ok, request} = OpenAI.prepare_request(:chat, model, "Hello", opts)
+
+      refute Map.has_key?(request.headers, "authorization")
+      refute request.options[:auth]
+    end
+
+    test "anonymous speech omits credentials on the public request path" do
+      model = %LLMDB.Model{provider: :openai, id: "anonymous-tts-model"}
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        assert conn.request_path == "/v1/audio/speech"
+        assert Plug.Conn.get_req_header(conn, "authorization") == []
+
+        conn
+        |> Plug.Conn.put_resp_content_type("audio/mpeg")
+        |> Plug.Conn.send_resp(200, "synthetic-audio")
+      end)
+
+      for mode <- [:none, "none"],
+          auth_opts <- [[auth_mode: mode], [provider_options: [auth_mode: mode]]],
+          api_key <- ["synthetic-configured-api-key", ""] do
+        opts =
+          auth_opts ++
+            [
+              api_key: api_key,
+              oauth_file: "/missing/synthetic-oauth.json",
+              base_url: "http://example.invalid/v1",
+              req_http_options: [plug: {Req.Test, __MODULE__}]
+            ]
+
+        assert {:ok, %ReqLLM.Speech.Result{audio: "synthetic-audio"}} =
+                 ReqLLM.speak(model, "Hello", opts)
+      end
+    end
+
+    test "anonymous speech rejects contradictory HTTP authentication" do
+      model = %LLMDB.Model{provider: :openai, id: "anonymous-tts-model"}
+
+      for http_opts <- [
+            [auth: {:bearer, "synthetic-must-not-leak"}],
+            [headers: [{"Authorization", "Bearer synthetic-must-not-leak"}]]
+          ] do
+        assert_raise ReqLLM.Error.Invalid.Parameter, ~r/Anonymous authentication/, fn ->
+          OpenAI.prepare_request(:speech, model, "Hello",
+            auth_mode: :none,
+            req_http_options: http_opts
+          )
+        end
+      end
+    end
+
+    test "anonymous speech and Files reject authenticated Req defaults" do
+      defaults = Req.default_options()
+      on_exit(fn -> Req.default_options(defaults) end)
+      model = %LLMDB.Model{provider: :openai, id: "anonymous-tts-model"}
+
+      Req.Test.stub(__MODULE__, fn _conn ->
+        flunk("Anonymous requests must reject inherited credentials before HTTP dispatch")
+      end)
+
+      opts = [
+        auth_mode: :none,
+        api_key: "synthetic-configured-api-key",
+        base_url: "http://example.invalid/v1",
+        req_http_options: [plug: {Req.Test, __MODULE__}]
+      ]
+
+      for http_auth <- [
+            [auth: {:bearer, "synthetic-inherited-credential"}],
+            [headers: [{"Authorization", "Bearer synthetic-inherited-credential"}]]
+          ] do
+        Req.default_options(Keyword.merge(defaults, http_auth))
+
+        assert_raise ReqLLM.Error.Invalid.Parameter, ~r/Anonymous authentication/, fn ->
+          ReqLLM.speak(model, "Hello", opts)
+        end
+
+        assert_raise ReqLLM.Error.Invalid.Parameter, ~r/Anonymous authentication/, fn ->
+          ReqLLM.Providers.OpenAI.Files.list(opts)
+        end
+      end
+    end
+
+    test "speech keeps bearer authentication by default" do
+      model = %LLMDB.Model{provider: :openai, id: "anonymous-tts-model"}
+
+      Req.Test.stub(__MODULE__, fn conn ->
+        assert Plug.Conn.get_req_header(conn, "authorization") == ["Bearer synthetic-api-key"]
+
+        conn
+        |> Plug.Conn.put_resp_content_type("audio/mpeg")
+        |> Plug.Conn.send_resp(200, "synthetic-audio")
+      end)
+
+      assert {:ok, %ReqLLM.Speech.Result{audio: "synthetic-audio"}} =
+               ReqLLM.speak(model, "Hello",
+                 api_key: "synthetic-api-key",
+                 base_url: "http://example.invalid/v1",
+                 req_http_options: [plug: {Req.Test, __MODULE__}]
+               )
     end
 
     test "prepare_request supports oauth credentials loaded from file" do
