@@ -16,6 +16,9 @@ defmodule ReqLLM.Billing do
 
   def calculate(usage, %LLMDB.Model{} = model, context) when is_map(usage) do
     with true <- Pricing.components(model) != [],
+         true <-
+           Tool.valid_usage?(MapAccess.get_raw(usage, :tool_usage)) and
+             Image.valid_usage?(MapAccess.get_raw(usage, :image_usage)),
          {:ok, meters} <- meters(usage, model),
          {:ok, modality} <- modality_counts(usage, model, meters),
          meters <- Map.put(meters, :modality, modality),
@@ -25,6 +28,8 @@ defmodule ReqLLM.Billing do
          main_meters <- if(write_groups, do: %{meters | cache_write: 0}, else: meters),
          {:ok, rates, modifiers} <- selected_components(selection, main_meters, usage),
          :ok <- validate_coverage(rates, selection, main_meters, usage),
+         true <-
+           tool_coverage?(rates, usage) and image_coverage?(rates, main_meters, usage, model),
          main_rates <-
            if(write_groups, do: Enum.reject(rates, &(meter_key(&1) == :cache_write)), else: rates),
          {:ok, items} <- price_components(main_rates, modifiers, main_meters, usage, rates),
@@ -70,7 +75,7 @@ defmodule ReqLLM.Billing do
     output_reported = Map.get(reported, :output, Map.get(reported, "output", not is_nil(output)))
     input = input || 0
     output = output || 0
-    complete = Map.get(usage, :billing_usage_complete, true)
+    complete = MapAccess.get_raw(usage, :billing_usage_complete) in [nil, true]
 
     if valid_token_count?(input) and valid_token_count?(output) and
          valid_token_count?(cache_read) and valid_token_count?(cache_write) and
@@ -316,6 +321,55 @@ defmodule ReqLLM.Billing do
       :ok
     else
       :error
+    end
+  end
+
+  defp tool_coverage?(rates, usage) do
+    usage
+    |> MapAccess.get(:tool_usage, %{})
+    |> Tool.normalize()
+    |> Enum.all?(fn {tool, entry} ->
+      count = MapAccess.get(entry, :count)
+      unit = Tool.normalize_unit(MapAccess.get(entry, :unit))
+
+      valid_count?(count) and
+        (count == 0 or
+           Enum.any?(rates, fn
+             %Component{kind: :tools, tool: rate_tool, unit: rate_unit}
+             when (is_atom(rate_tool) or is_binary(rate_tool)) and not is_nil(rate_tool) ->
+               to_string(rate_tool) == to_string(tool) and rate_unit in [nil, unit]
+
+             _ ->
+               false
+           end))
+    end)
+  end
+
+  defp image_coverage?(rates, meters, usage, model) do
+    generated =
+      usage
+      |> MapAccess.get(:image_usage, %{})
+      |> Image.normalize()
+      |> MapAccess.get(:generated, %{})
+
+    count = MapAccess.get(generated, :count, 0)
+    size = MapAccess.get(generated, :size_class)
+
+    valid_count?(count) and
+      (count == 0 or
+         image_token_coverage?(rates, meters, model) or
+         Enum.any?(rates, fn
+           %Component{kind: :images, size_class: rate_size} -> rate_size in [nil, size]
+           _ -> false
+         end))
+  end
+
+  defp image_token_coverage?(rates, meters, model) do
+    if is_map(meters.modality) do
+      Map.get(meters.modality, "image_output_tokens", 0) > 0
+    else
+      model.modalities[:output] == [:image] and meters.output > 0 and
+        Enum.any?(rates, &(meter_key(&1) == :output))
     end
   end
 
