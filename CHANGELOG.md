@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 <!-- changelog -->
 
+## [v1.27.0](https://github.com/agentjido/req_llm/compare/v1.26.0...v1.27.0) (2026-10-08)
+
+
+
+
+### Features:
+
+* azure: support Chat Completions logprobs (#1073) by Arton Ragsdale
+
+* allow Gemini 3 object output with tools (#1077) by mvanhorn
+
+* openai: support Decisions evaluations (#1075) by mikehostetler
+
+### Bug Fixes:
+
+* schema: bound validator cache memory (#1078) by mikehostetler
+
+* redact unknown provider reasoning payloads (#1070) by Wu Shuwen
+
+* close shared contract gaps from design review (#1069) by mikehostetler
+
+* openai: enforce anonymous auth and exact streaming model identity (#1065) by Justin Smestad
+
+* openai: decode Responses refusals as text with content_filter finish reason (#1064) by Nickjgniklu
+
+* http: prevent non-streaming connection pool timeouts (#1067) by mikehostetler
+
 ## [v1.26.0](https://github.com/agentjido/req_llm/compare/v1.25.0...v1.26.0) (2026-09-29)
 
 
